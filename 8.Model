@@ -1,0 +1,2232 @@
+"""
+Multi-Modal 2D MRI Joint Segmentation and Classification Training Framework
+
+Purpose:
+    Unified training system for medical image segmentation and PCR classification
+    Handles missing modalities through modal completion layer
+    Joint optimization of segmentation and classification tasks
+
+Architecture:
+    - Modal Completion Layer: Cross-modal feature generation for missing modalities
+    - Shared Main Encoder: U-Net encoder for multi-scale feature extraction
+    - Segmentation Decoder: U-Net decoder for lesion segmentation
+    - Classification Branch: Swin Transformer + Feature Compression for PCR prediction
+
+Features:
+    - Multi-modality support (T1, T2, T1C)
+    - Missing modality handling through learnable generators
+    - Comprehensive data augmentation (geometric, elastic, intensity)
+    - Dual-task learning with adjustable loss weights
+    - Checkpoint management and resume training support
+    - Real-time performance visualization
+
+Author: Medical Imaging Research Team
+Version: 2.0
+License: MIT
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import cv2
+from tqdm import tqdm
+import json
+import matplotlib.pyplot as plt
+import random
+import os
+from pathlib import Path
+from scipy.ndimage import gaussian_filter
+from scipy import ndimage
+import warnings
+import re
+import pandas as pd
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from datetime import datetime
+
+warnings.filterwarnings('ignore')
+
+
+# ==================== Configuration ====================
+
+CONFIG = {
+    # Data paths
+    'train_root': './data/TRAIN',
+    'val_root': './data/VAL',
+    'test1_root': './data/TEST1',
+    'test2_root': './data/TEST2',
+    'clinical_file': './data/clinical_labels.csv',
+    
+    # Output paths
+    'save_dir': './checkpoints',
+    'log_dir': './logs',
+    
+    # Model configuration
+    'modalities': ['T1', 'T2', 'T1C'],
+    'num_modalities': 3,
+    'img_size': (512, 512),
+    'base_features': 32,
+    'out_channels': 1,
+    
+    # Training parameters
+    'batch_size': 8,
+    'max_iterations': 200000,
+    'initial_lr': 1e-4,
+    'weight_decay': 1e-3,
+    'gradient_clip_value': 1.0,
+    'label_smoothing': 0.2,
+    
+    # Task-specific learning rates
+    'segmentation_lr': 1e-4,
+    'classification_lr': 1e-5,
+    
+    # Model control
+    'enable_classification': True,
+    'freeze_segmentation': False,
+    'freeze_classification': False,
+    
+    # Model loading (Complete model recommended)
+    'load_complete_model': None,      # Path to complete model checkpoint
+    'load_segmentation_model': None,  # Path to segmentation-only model (legacy)
+    'load_classification_model': None, # Path to classification-only model (legacy)
+    
+    # Resume training
+    'resume_checkpoint': None,
+    'continue_training': False,
+    'training_curves_file': './checkpoints/training_curves.json',
+    
+    # Evaluation
+    'eval_interval': 200,
+    'vis_interval': 200,
+    'save_interval': 500,
+    'num_workers': 12,
+    
+    # Device
+    'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+}
+
+# Extract commonly used config values
+TRAIN_DIR = CONFIG['train_root']
+VAL_DIR = CONFIG['val_root']
+TEST_DIR1 = CONFIG['test1_root']
+TEST_DIR2 = CONFIG['test2_root']
+CLINICAL_FILE = CONFIG['clinical_file']
+SAVE_DIR = CONFIG['save_dir']
+LOG_DIR = CONFIG['log_dir']
+MODALITIES = CONFIG['modalities']
+NUM_MODALITIES = CONFIG['num_modalities']
+IMG_SIZE = CONFIG['img_size']
+BASE_FEATURES = CONFIG['base_features']
+OUT_CHANNELS = CONFIG['out_channels']
+BATCH_SIZE = CONFIG['batch_size']
+MAX_ITERATIONS = CONFIG['max_iterations']
+INITIAL_LEARNING_RATE = CONFIG['initial_lr']
+WEIGHT_DECAY = CONFIG['weight_decay']
+GRADIENT_CLIP_VALUE = CONFIG['gradient_clip_value']
+LABEL_SMOOTHING = CONFIG['label_smoothing']
+SEGMENTATION_LR = CONFIG['segmentation_lr']
+CLASSIFICATION_LR = CONFIG['classification_lr']
+ENABLE_CLASSIFICATION = CONFIG['enable_classification']
+FREEZE_SEGMENTATION = CONFIG['freeze_segmentation']
+FREEZE_CLASSIFICATION = CONFIG['freeze_classification']
+LOAD_COMPLETE_MODEL = CONFIG['load_complete_model']
+LOAD_SEGMENTATION_MODEL = CONFIG['load_segmentation_model']
+LOAD_CLASSIFICATION_MODEL = CONFIG['load_classification_model']
+RESUME_CHECKPOINT = CONFIG['resume_checkpoint']
+CONTINUE_TRAINING = CONFIG['continue_training']
+TRAINING_CURVES_FILE = CONFIG['training_curves_file']
+VIS_INTERVAL = CONFIG['vis_interval']
+SAVE_INTERVAL = CONFIG['save_interval']
+EVAL_INTERVAL = CONFIG['eval_interval']
+NUM_WORKERS = CONFIG['num_workers']
+DEVICE = CONFIG['device']
+
+print(f"[INFO] Configuration loaded")
+print(f"  Device: {DEVICE}")
+print(f"  Modalities: {MODALITIES}")
+print(f"  Image size: {IMG_SIZE}")
+print(f"  Batch size: {BATCH_SIZE}")
+print(f"  Max iterations: {MAX_ITERATIONS}")
+print(f"  Classification enabled: {ENABLE_CLASSIFICATION}")
+
+
+# ==================== Modal Completion Layer ====================
+
+class LightweightModalEncoder(nn.Module):
+    """
+    Lightweight modal encoder for quick feature extraction.
+    
+    Uses 2-3 convolutional layers to extract preliminary features
+    from individual modalities.
+    """
+    
+    def __init__(self, base_features):
+        super(LightweightModalEncoder, self).__init__()
+        
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(1, base_features, 3, padding=1, bias=False),
+            nn.BatchNorm2d(base_features),
+            nn.ReLU(inplace=True)
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(base_features, base_features, 3, padding=1, bias=False),
+            nn.BatchNorm2d(base_features),
+            nn.ReLU(inplace=True)
+        )
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(base_features, base_features, 3, padding=1, bias=False),
+            nn.BatchNorm2d(base_features),
+            nn.ReLU(inplace=True)
+        )
+    
+    def forward(self, x):
+        """
+        Args:
+            x: [B, 1, H, W] - Single modality input
+            
+        Returns:
+            [B, base_features, H, W] - Encoded features
+        """
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        return x
+
+
+class CrossModalGenerator(nn.Module):
+    """
+    Cross-modal feature generator for synthesizing missing modalities.
+    
+    Learns to generate pseudo-features for missing modalities from
+    available ones using residual blocks.
+    """
+    
+    def __init__(self, base_features, num_modalities=3):
+        super(CrossModalGenerator, self).__init__()
+        
+        self.num_modalities = num_modalities
+        
+        # Residual blocks for feature generation
+        self.generator_blocks = nn.Sequential(
+            self._make_residual_block(base_features * num_modalities, base_features * 2),
+            self._make_residual_block(base_features * 2, base_features * 2),
+            self._make_residual_block(base_features * 2, base_features * num_modalities)
+        )
+        
+        # Per-modality output heads
+        self.modal_heads = nn.ModuleDict({
+            'T1': nn.Conv2d(base_features * num_modalities, base_features, 1),
+            'T2': nn.Conv2d(base_features * num_modalities, base_features, 1),
+            'T1C': nn.Conv2d(base_features * num_modalities, base_features, 1)
+        })
+    
+    def _make_residual_block(self, in_channels, out_channels):
+        """Create a residual block"""
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels)
+        )
+    
+    def forward(self, modal_features, modal_mask):
+        """
+        Generate pseudo-features for missing modalities.
+        
+        Args:
+            modal_features: dict {modality: [B, C, H, W]} - Available features
+            modal_mask: [B, num_modalities] - Availability mask
+            
+        Returns:
+            dict {modality: [B, C, H, W]} - Complete modality features
+        """
+        B, device = modal_mask.shape[0], modal_mask.device
+        modalities = ['T1', 'T2', 'T1C']
+        
+        # Get spatial dimensions from any available feature
+        sample_feat = next(iter(modal_features.values()))
+        H, W = sample_feat.shape[2:]
+        C = sample_feat.shape[1]
+        
+        # Create concatenated input (missing modalities as zeros)
+        concat_features = []
+        for i, mod in enumerate(modalities):
+            if mod in modal_features:
+                concat_features.append(modal_features[mod])
+            else:
+                concat_features.append(torch.zeros(B, C, H, W, device=device))
+        
+        concat_input = torch.cat(concat_features, dim=1)  # [B, 3*C, H, W]
+        
+        # Generate features
+        generated = self.generator_blocks(concat_input)  # [B, 3*C, H, W]
+        
+        # Select real or generated features
+        complete_features = {}
+        for i, mod in enumerate(modalities):
+            if mod in modal_features:
+                complete_features[mod] = modal_features[mod]  # Use real features
+            else:
+                complete_features[mod] = self.modal_heads[mod](generated)  # Use generated
+        
+        return complete_features
+
+
+class ModalCompletionLayer(nn.Module):
+    """
+    Unified modal completion layer for handling missing modalities.
+    
+    Combines lightweight encoders and cross-modal generators to produce
+    complete multi-modal features even when some modalities are missing.
+    """
+    
+    def __init__(self, base_features, modalities):
+        super(ModalCompletionLayer, self).__init__()
+        
+        self.modalities = modalities
+        self.base_features = base_features
+        
+        # Lightweight encoders for each modality
+        self.modal_encoders = nn.ModuleDict({
+            mod: LightweightModalEncoder(base_features) for mod in modalities
+        })
+        
+        # Cross-modal generator
+        self.cross_modal_generator = CrossModalGenerator(base_features, len(modalities))
+    
+    def forward(self, images, modal_mask):
+        """
+        Complete missing modalities and produce unified features.
+        
+        Args:
+            images: [B, num_modalities, H, W] - Input images (zeros for missing)
+            modal_mask: [B, num_modalities] - Availability mask (1=available, 0=missing)
+            
+        Returns:
+            completed_tensor: [B, 3*base_features, H, W] - Concatenated features
+            complete_features: dict - Individual modality features
+            reconstruction_targets: dict - Targets for reconstruction loss
+        """
+        B = images.shape[0]
+        
+        # Extract features from available modalities
+        available_features = {}
+        all_modal_features = {}
+        
+        for i, mod in enumerate(self.modalities):
+            modal_input = images[:, i:i+1]  # [B, 1, H, W]
+            encoded = self.modal_encoders[mod](modal_input)  # [B, C, H, W]
+            all_modal_features[mod] = encoded
+            
+            # Check if any sample in batch has this modality
+            if modal_mask[:, i].sum() > 0:
+                available_features[mod] = encoded
+        
+        # Generate features for missing modalities
+        if len(available_features) < len(self.modalities):
+            complete_features = self.cross_modal_generator(available_features, modal_mask)
+        else:
+            complete_features = available_features
+        
+        # Concatenate all modality features
+        completed_tensor = torch.cat([
+            complete_features[mod] for mod in self.modalities
+        ], dim=1)  # [B, 3*base_features, H, W]
+        
+        # Prepare reconstruction targets
+        reconstruction_targets = {
+            mod: all_modal_features[mod] for mod in self.modalities
+        }
+        
+        return completed_tensor, complete_features, reconstruction_targets
+
+
+# ==================== Shared Main Encoder (U-Net Encoder) ====================
+
+class Shared
+
+MainEncoder(nn.Module):
+    """
+    Shared U-Net encoder processing complete multi-modal features.
+    
+    Takes complete (or completed) multi-modal features and extracts
+    multi-scale representations for both segmentation and classification.
+    """
+    
+    def __init__(self, input_channels, base_features=32):
+        super(SharedMainEncoder, self).__init__()
+        
+        # U-Net encoder - process features from modal completion layer
+        self.enc1 = self._double_conv(input_channels, base_features)           
+        self.enc2 = self._double_conv(base_features, base_features * 2)        
+        self.enc3 = self._double_conv(base_features * 2, base_features * 3)    
+        self.enc4 = self._double_conv(base_features * 3, base_features * 4)    
+        self.bottleneck = self._double_conv(base_features * 4, base_features * 6)  
+        
+        self.pool = nn.MaxPool2d(2)
+    
+    def _double_conv(self, in_channels, out_channels):
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.2),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1)
+        )
+    
+    def forward(self, x):
+        """
+        Args:
+            x: [B, 3*base_features, H, W] - Complete multi-modal features
+            
+        Returns:
+            dict: Multi-scale features for U-Net decoder
+        """
+        enc1 = self.enc1(x)                    
+        enc2 = self.enc2(self.pool(enc1))      
+        enc3 = self.enc3(self.pool(enc2))      
+        enc4 = self.enc4(self.pool(enc3))      
+        bottleneck = self.bottleneck(self.pool(enc4))  
+        
+        return {
+            'enc1': enc1,
+            'enc2': enc2,
+            'enc3': enc3,
+            'enc4': enc4,
+            'bottleneck': bottleneck
+        }
+
+
+# ==================== Segmentation Decoder ====================
+
+class SegmentationDecoder(nn.Module):
+    """
+    U-Net segmentation decoder.
+    
+    Reconstructs segmentation mask from multi-scale encoder features
+    using transposed convolutions and skip connections.
+    """
+    
+    def __init__(self, base_features, out_channels=1):
+        super(SegmentationDecoder, self).__init__()
+        
+        # U-Net decoder
+        self.up1 = self._up_block(base_features * 6, base_features * 4)   
+        self.up2 = self._up_block(base_features * 4, base_features * 3)   
+        self.up3 = self._up_block(base_features * 3, base_features * 2)   
+        self.up4 = self._up_block(base_features * 2, base_features)
+        
+        # Segmentation output layer
+        self.output_conv = nn.Conv2d(base_features, out_channels, 1)
+    
+    def _up_block(self, in_channels, out_channels):
+        return nn.Sequential(
+            nn.ConvTranspose2d(in_channels, out_channels, 2, stride=2),
+            nn.Conv2d(out_channels * 2, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+    
+    def forward(self, encoder_features):
+        """
+        Args:
+            encoder_features: Dict with multi-scale features from encoder
+            
+        Returns:
+            [B, out_channels, H, W] - Segmentation mask
+        """
+        x = encoder_features['bottleneck']
+        
+        # Upsample with skip connections
+        x = self.up1[0](x)  # ConvTranspose
+        x = torch.cat([x, encoder_features['enc4']], dim=1)
+        x = self.up1[1:](x)  # Remaining convolutions
+        
+        x = self.up2[0](x)
+        x = torch.cat([x, encoder_features['enc3']], dim=1)
+        x = self.up2[1:](x)
+        
+        x = self.up3[0](x)
+        x = torch.cat([x, encoder_features['enc2']], dim=1)
+        x = self.up3[1:](x)
+        
+        x = self.up4[0](x)
+        x = torch.cat([x, encoder_features['enc1']], dim=1)
+        x = self.up4[1:](x)
+        
+        # Segmentation output
+        seg_output = self.output_conv(x)
+        return seg_output
+
+
+# ==================== Swin Transformer for Classification ====================
+
+class WindowAttention(nn.Module):
+    """Window-based Multi-head Self Attention with relative position bias."""
+    
+    def __init__(self, dim, window_size, num_heads, qkv_bias=True, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        # Relative position bias table
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads))
+
+        # Calculate relative position indices
+        coords_h = torch.arange(self.window_size[0])
+        coords_w = torch.arange(self.window_size[1])
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))
+        coords_flatten = torch.flatten(coords, 1)
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+        relative_coords[:, :, 0] += self.window_size[0] - 1
+        relative_coords[:, :, 1] += self.window_size[1] - 1
+        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+        relative_position_index = relative_coords.sum(-1)
+        self.register_buffer("relative_position_index", relative_position_index)
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        nn.init.normal_(self.relative_position_bias_table, std=.02)
+
+    def forward(self, x, mask=None):
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        q = q * self.scale
+        attn = (q @ k.transpose(-2, -1))
+
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+        attn = attn + relative_position_bias.unsqueeze(0)
+
+        if mask is not None:
+            nW = mask.shape[0]
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+            attn = F.softmax(attn, dim=-1)
+        else:
+            attn = F.softmax(attn, dim=-1)
+
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+def window_partition(x, window_size):
+    """Partition feature map into windows."""
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    return windows
+
+
+def window_reverse(windows, window_size, H, W):
+    """Reverse window partition back to feature map."""
+    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    return x
+
+
+class SwinTransformerBlock(nn.Module):
+    """Swin Transformer Block with Window/Shifted Window Multi-head Self Attention."""
+    
+    def __init__(self, dim, input_resolution, num_heads, window_size=4, shift_size=0,
+                 mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0., drop_path=0.):
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.mlp_ratio = mlp_ratio
+        
+        # Adaptive window_size and shift_size
+        if min(self.input_resolution) <= self.window_size:
+            self.shift_size = 0
+            self.window_size = min(self.input_resolution)
+        
+        self.window_size = max(1, self.window_size)
+        self.shift_size = min(self.shift_size, self.window_size // 2)
+        
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = WindowAttention(
+            dim, window_size=(self.window_size, self.window_size),
+            num_heads=num_heads, qkv_bias=qkv_bias, 
+            attn_drop=attn_drop, proj_drop=drop)
+        
+        self.drop_path = nn.Identity() if drop_path == 0. else nn.Dropout(drop_path)
+        self.norm2 = nn.LayerNorm(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(drop),
+            nn.Linear(mlp_hidden_dim, dim),
+            nn.Dropout(drop)
+        )
+
+    def forward(self, x):
+        H, W = self.input_resolution
+        B, L, C = x.shape
+        
+        assert L == H * W, f"Input sequence length {L} != H*W = {H*W}"
+        
+        shortcut = x
+        x = self.norm1(x)
+        x = x.view(B, H, W, C)
+        
+        # Cyclic shift
+        if self.shift_size > 0:
+            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        else:
+            shifted_x = x
+        
+        # Partition windows
+        x_windows = window_partition(shifted_x, self.window_size)
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
+        
+        # W-MSA/SW-MSA
+        attn_windows = self.attn(x_windows)
+        
+        # Merge windows
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+        shifted_x = window_reverse(attn_windows, self.window_size, H, W)
+        
+        # Reverse cyclic shift
+        if self.shift_size > 0:
+            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        else:
+            x = shifted_x
+        
+        x = x.view(B, H * W, C)
+        
+        # FFN
+        x = shortcut + self.drop_path(x)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
+
+class PatchMerging(nn.Module):
+    """Downsample layer merging 2x2 patches."""
+    
+    def __init__(self, input_resolution, dim):
+        super().__init__()
+        self.input_resolution = input_resolution
+        self.dim = dim
+        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+        self.norm = nn.LayerNorm(4 * dim)
+
+    def forward(self, x):
+        H, W = self.input_resolution
+        B, L, C = x.shape
+        
+        x = x.view(B, H, W, C)
+
+        x0 = x[:, 0::2, 0::2, :]
+        x1 = x[:, 1::2, 0::2, :]
+        x2 = x[:, 0::2, 1::2, :]
+        x3 = x[:, 1::2, 1::2, :]
+        x = torch.cat([x0, x1, x2, x3], -1)
+        x = x.view(B, -1, 4 * C)
+
+        x = self.norm(x)
+        x = self.reduction(x)
+
+        return x
+
+
+class LightweightSwinTransformerV2(nn.Module):
+    """
+    Lightweight Swin Transformer V2 for classification.
+    
+    Processes 2D feature maps (from encoder bottleneck) for PCR prediction.
+    """
+    
+    def __init__(self, input_channels=3, embed_dim=96, input_resolution=8,
+                 depths=[2, 2], num_heads=[3, 6], window_size=4, mlp_ratio=4., 
+                 drop_rate=0.1, attn_drop_rate=0.1, drop_path_rate=0.2, num_classes=1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_layers = len(depths)
+        self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
+        self.input_resolution = input_resolution
+        
+        print(f"[INFO] Swin Transformer init: resolution={input_resolution}, embed_dim={embed_dim}")
+        
+        # 2D conv projection layer
+        self.patch_embed = nn.Conv2d(input_channels, embed_dim, kernel_size=1)
+        self.pos_drop = nn.Dropout(p=drop_rate)
+        
+        # Stochastic depth
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+        
+        # Build layers
+        self.layers = nn.ModuleList()
+        for i_layer in range(self.num_layers):
+            current_resolution = input_resolution // (2 ** i_layer)
+            current_resolution = max(1, current_resolution)
+            layer_resolution = (current_resolution, current_resolution)
+            layer_dim = int(embed_dim * 2 ** i_layer)
+            
+            adaptive_window_size = min(window_size, current_resolution // 2) if current_resolution > 2 else 1
+            adaptive_window_size = max(1, adaptive_window_size)
+            
+            print(f"  Layer {i_layer}: resolution={layer_resolution}, dim={layer_dim}, window_size={adaptive_window_size}")
+            
+            layer_blocks = nn.ModuleList([
+                SwinTransformerBlock(
+                    dim=layer_dim,
+                    input_resolution=layer_resolution,
+                    num_heads=num_heads[min(i_layer, len(num_heads)-1)],
+                    window_size=adaptive_window_size,
+                    shift_size=0 if (j % 2 == 0) else adaptive_window_size // 2,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=True,
+                    drop=drop_rate,
+                    attn_drop=attn_drop_rate,
+                    drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])][j] if j < len(dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])]) else 0.0
+                ) for j in range(depths[i_layer])
+            ])
+            
+            if i_layer < self.num_layers - 1 and current_resolution > 1:
+                downsample = PatchMerging(input_resolution=layer_resolution, dim=layer_dim)
+            else:
+                downsample = None
+                
+            self.layers.append(nn.ModuleDict({
+                'blocks': layer_blocks,
+                'downsample': downsample
+            }))
+        
+        self.norm = nn.LayerNorm(self.num_features)
+        self.avgpool = nn.AdaptiveAvgPool1d(1)
+        
+        # Classification head
+        self.head = nn.Sequential(
+            nn.Linear(self.num_features, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(64, num_classes)
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: [B, C, H, W] - 2D feature map from encoder
+            
+        Returns:
+            [B, num_classes] - Classification logits
+        """
+        B, C, H, W = x.shape
+        
+        # Verify input size
+        expected_size = self.input_resolution
+        if H != expected_size or W != expected_size:
+            x = F.adaptive_avg_pool2d(x, (expected_size, expected_size))
+            H, W = expected_size, expected_size
+        
+        # 2D conv projection to embedding dimension
+        x = self.patch_embed(x)  # [B, embed_dim, H, W]
+        B, embed_dim, H, W = x.shape
+        
+        # Convert to sequence format [B, H*W, embed_dim]
+        x = x.flatten(2).transpose(1, 2)
+        x = self.pos_drop(x)
+        
+        current_h, current_w = H, W
+        
+        # Pass through Swin layers
+        for layer in self.layers:
+            for block in layer['blocks']:
+                block.input_resolution = (current_h, current_w)
+                x = block(x)
+            
+            # Downsample
+            if layer['downsample'] is not None:
+                layer['downsample'].input_resolution = (current_h, current_w)
+                x = layer['downsample'](x)
+                current_h, current_w = current_h // 2, current_w // 2
+                current_h, current_w = max(1, current_h), max(1, current_w)
+        
+        x = self.norm(x)  # [B, L, C]
+        x = self.avgpool(x.transpose(1, 2))  # [B, C, 1]
+        x = torch.flatten(x, 1)  # [B, C]
+        x = self.head(x)
+        return x
+
+
+# ==================== Segmentation Feature Compressor ====================
+
+class SegmentationFeatureCompressor(nn.Module):
+    """
+    Compresses multi-slice segmentation features for classification.
+    
+    Fuses 5 adjacent slices' encoder features through projection and pooling.
+    """
+    
+    def __init__(self, base_features, img_size=(512, 512)):
+        super(SegmentationFeatureCompressor, self).__init__()
+        self.img_size = img_size
+        
+        # Feature projectors for 5 slices x 5 encoder levels = 25 projectors
+        self.feature_projectors = nn.ModuleList([
+            # Slice 1 projectors (5 encoder levels)
+            nn.Conv2d(base_features, 16, 1),      # enc1
+            nn.Conv2d(base_features * 2, 16, 1),  # enc2  
+            nn.Conv2d(base_features * 3, 16, 1),  # enc3
+            nn.Conv2d(base_features * 4, 16, 1),  # enc4
+            nn.Conv2d(base_features * 6, 16, 1),  # bottleneck
+            # Slice 2 projectors
+            nn.Conv2d(base_features, 16, 1),
+            nn.Conv2d(base_features * 2, 16, 1),
+            nn.Conv2d(base_features * 3, 16, 1),
+            nn.Conv2d(base_features * 4, 16, 1),
+            nn.Conv2d(base_features * 6, 16, 1),
+            # Slice 3 projectors (center slice)
+            nn.Conv2d(base_features, 16, 1),
+            nn.Conv2d(base_features * 2, 16, 1),
+            nn.Conv2d(base_features * 3, 16, 1),
+            nn.Conv2d(base_features * 4, 16, 1),
+            nn.Conv2d(base_features * 6, 16, 1),
+            # Slice 4 projectors
+            nn.Conv2d(base_features, 16, 1),
+            nn.Conv2d(base_features * 2, 16, 1),
+            nn.Conv2d(base_features * 3, 16, 1),
+            nn.Conv2d(base_features * 4, 16, 1),
+            nn.Conv2d(base_features * 6, 16, 1),
+            # Slice 5 projectors
+            nn.Conv2d(base_features, 16, 1),
+            nn.Conv2d(base_features * 2, 16, 1),
+            nn.Conv2d(base_features * 3, 16, 1),
+            nn.Conv2d(base_features * 4, 16, 1),
+            nn.Conv2d(base_features * 6, 16, 1),
+        ])
+        
+        # Adaptive pooling size based on image size
+        min_size = min(img_size)
+        if min_size >= 256:
+            self.pool_size = (8, 8)
+        elif min_size >= 128:
+            self.pool_size = (4, 4)
+        else:
+            self.pool_size = (2, 2)
+        
+        self.global_pool = nn.AdaptiveAvgPool2d(self.pool_size)
+        
+        # Final compression: 25 features x 16 channels = 400 channels
+        self.final_compressor = nn.Sequential(
+            nn.Conv2d(16 * 25, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, multi_slice_seg_features):
+        """
+        Args:
+            multi_slice_seg_features: list of dicts - Segmentation features
+                                      5-slice mode: list of 5 dicts
+                                      single-slice mode: list of 1 dict (repeated 5 times)
+                                      Each dict contains: {'enc1', 'enc2', 'enc3', 'enc4', 'bottleneck'}
+        Returns:
+            [B, 64, pool_size, pool_size] - Compressed segmentation features
+        """
+        compressed_feats = []
+        
+        # Handle input modes
+        if len(multi_slice_seg_features) == 1:
+            # Single slice mode: repeat single dict 5 times
+            single_features = multi_slice_seg_features[0]
+            multi_slice_seg_features = [single_features] * 5
+        elif len(multi_slice_seg_features) != 5:
+            raise ValueError(f"Expected 5 or 1 slice features, got {len(multi_slice_seg_features)}")
+        
+        # Extract and compress features for 5 slices x 5 encoder levels
+        layer_names = ['enc1', 'enc2', 'enc3', 'enc4', 'bottleneck']
+        projector_idx = 0
+        
+        for slice_idx in range(5):
+            seg_features = multi_slice_seg_features[slice_idx]
+            for layer_name in layer_names:
+                feat = seg_features[layer_name]  # [B, channels, H, W]
+                compressed = self.feature_projectors[projector_idx](feat)  # [B, 16, H, W]
+                pooled = self.global_pool(compressed)  # [B, 16, pool_size, pool_size]
+                compressed_feats.append(pooled)
+                projector_idx += 1
+        
+        # Stack all compressed features: 5 slices x 5 encoders = 25 features
+        stacked_features = torch.cat(compressed_feats, dim=1)  # [B, 16*25, pool_size, pool_size]
+        
+        # Final compression
+        final_features = self.final_compressor(stacked_features)  # [B, 64, pool_size, pool_size]
+        
+        return final_features
+
+
+# ==================== Complete Multi-Modal U-Net Model ====================
+
+class MultiModal2DUNet(nn.Module):
+    """
+    Unified multi-modal segmentation + classification system.
+    
+    Architecture:
+        1. Modal Completion Layer: Handle missing modalities
+        2. Shared Main Encoder: Extract multi-scale features
+        3. Segmentation Decoder: Generate lesion masks
+        4. Classification Branch: Predict PCR (dual-path design)
+           - Main path: Swin Transformer on bottleneck features
+           - Auxiliary path: Segmentation feature compressor
+    """
+    
+    def __init__(self, modalities, out_channels=1, base_features=32, 
+                 img_size=(512, 512), enable_classification=True):
+        super(MultiModal2DUNet, self).__init__()
+        self.modalities = modalities
+        self.base_features = base_features
+        self.enable_classification = enable_classification
+        self.img_size = img_size
+        
+        # 1. Modal Completion Layer
+        self.modal_completion = ModalCompletionLayer(base_features, modalities)
+        
+        # 2. Shared Main Encoder
+        self.main_encoder = SharedMainEncoder(
+            input_channels=len(modalities) * base_features,
+            base_features=base_features
+        )
+        
+        # 3. Segmentation Decoder
+        self.segmentation_decoder = SegmentationDecoder(base_features, out_channels)
+        
+        # 4. Classification Components (dual-path design)
+        if self.enable_classification:
+            bottleneck_channels = base_features * 6
+            bottleneck_resolution = min(img_size) // 16
+            bottleneck_resolution = max(4, bottleneck_resolution)
+            
+            adaptive_window_size = min(4, bottleneck_resolution // 2)
+            adaptive_window_size = max(2, adaptive_window_size)
+            
+            print(f"[INFO] Classification branch config: bottleneck_channels={bottleneck_channels}, "
+                  f"resolution={bottleneck_resolution}, window_size={adaptive_window_size}")
+            
+            # Main path: Swin Transformer processes encoder bottleneck
+            self.swin_transformer = LightweightSwinTransformerV2(
+                input_channels=bottleneck_channels,
+                embed_dim=96,
+                input_resolution=bottleneck_resolution,
+                depths=[2, 2],
+                num_heads=[3, 6],
+                window_size=adaptive_window_size,
+                mlp_ratio=4.0,
+                drop_rate=0.1,
+                attn_drop_rate=0.1,
+                drop_path_rate=0.2,
+                num_classes=512  # Output feature vector
+            )
+            
+            # Auxiliary path: Segmentation feature compressor
+            self.seg_feature_compressor = SegmentationFeatureCompressor(base_features, img_size)
+            
+            # Feature fusion dimensions
+            pool_size = self.seg_feature_compressor.pool_size
+            seg_feature_dim = 64 * pool_size[0] * pool_size[1]
+            
+            # Feature fusion and final classification head
+            self.feature_fusion = nn.Sequential(
+                nn.Linear(512 + seg_feature_dim, 256),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.3),
+                nn.Linear(256, 128),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.2),
+                nn.Linear(128, 1)  # Binary classification output
+            )
+
+    def forward(self, images, modality_mask, return_features=False, return_classification=False, multi_slice_mode=False):
+        """
+        Unified forward pass for segmentation + classification.
+        
+        Args:
+            images: [B, num_modalities, H, W] or [B, 5, num_modalities, H, W]
+            modality_mask: [B, num_modalities] - Modality availability
+            return_features: Whether to return reconstruction features
+            return_classification: Whether to return classification results
+            multi_slice_mode: Whether using 5-slice mode
+            
+        Returns:
+            dict: {
+                'segmentation': [B, 1, H, W] - Segmentation mask
+                'classification': [B, 1] - Classification logits (if enabled)
+                'reconstruction_targets': dict - Reconstruction targets (if requested)
+                'complete_features': dict - Complete modality features (if requested)
+            }
+        """
+        if multi_slice_mode:
+            # 5-slice mode
+            B, num_slices, num_modalities, H, W = images.shape
+            return self._forward_multi_slice(images, modality_mask, return_features, return_classification)
+        else:
+            # Single-slice mode
+            return self._forward_single_slice(images, modality_mask, return_features, return_classification)
+    
+    def _forward_single_slice(self, images, modality_mask, return_features=False, return_classification=False):
+        """Single-slice forward pass."""
+        B = images.shape[0]
+        
+        # Step 1: Modal completion
+        completed_tensor, complete_features, reconstruction_targets = \
+            self.modal_completion(images, modality_mask)
+        
+        # Step 2: Shared main encoder
+        encoder_features = self.main_encoder(completed_tensor)
+        
+        # Step 3: Segmentation decoder
+        seg_output = self.segmentation_decoder(encoder_features)
+        
+        # Step 4: Classification branch (if enabled)
+        cls_output = None
+        if return_classification and self.enable_classification:
+            bottleneck_features = encoder_features['bottleneck']
+            
+            # Main path: Swin Transformer
+            swin_features = self.swin_transformer(bottleneck_features)  # [B, 512]
+            
+            # Auxiliary path: Segmentation feature compression
+            seg_compressed_features = self.seg_feature_compressor([encoder_features])
+            seg_features_flat = seg_compressed_features.view(B, -1)
+            
+            # Feature fusion
+            combined_features = torch.cat([swin_features, seg_features_flat], dim=1)
+            cls_output = self.feature_fusion(combined_features)  # [B, 1]
+        
+        # Return results
+        result = {'segmentation': seg_output}
+        if return_classification:
+            result['classification'] = cls_output
+        if return_features:
+            result['reconstruction_targets'] = reconstruction_targets
+            result['complete_features'] = complete_features
+        
+        return result
+    
+    def _forward_multi_slice(self, images, modality_mask, return_features=False, return_classification=False):
+        """
+        Multi-slice forward pass.
+        
+        Architecture: Segment center slice only, use 5-slice features for classification.
+        
+        Args:
+            images: [B, 5, num_modalities, H, W] - 5-slice images (center at index=2)
+            modality_mask: [B, num_modalities] - Modality availability
+        """
+        B, num_slices, num_modalities, H, W = images.shape
+        center_idx = 2  # Center slice index
+        
+        # Step 1: Segment center slice only
+        center_images = images[:, center_idx]  # [B, num_modalities, H, W]
+        
+        # Modal completion
+        completed_tensor, complete_features, reconstruction_targets = \
+            self.modal_completion(center_images, modality_mask)
+        
+        # Segmentation encoder
+        center_encoder_features = self.main_encoder(completed_tensor)
+        
+        # Segmentation decoder - center slice only
+        seg_output = self.segmentation_decoder(center_encoder_features)  # [B, 1, H, W]
+        
+        # Step 2: Extract adjacent slice features for classification (if needed)
+        cls_output = None
+        if return_classification and self.enable_classification:
+            # Extract encoder features from all 5 slices (no decoding)
+            multi_slice_seg_features = []
+            
+            for slice_idx in range(num_slices):
+                slice_images = images[:, slice_idx]  # [B, num_modalities, H, W]
+                
+                # Modal completion
+                completed_tensor_slice, _, _ = self.modal_completion(slice_images, modality_mask)
+                
+                # Encoder only (no decoder)
+                encoder_features = self.main_encoder(completed_tensor_slice)
+                multi_slice_seg_features.append(encoder_features)
+            
+            # Use center slice bottleneck for Swin
+            center_bottleneck = multi_slice_seg_features[center_idx]['bottleneck']
+            swin_features = self.swin_transformer(center_bottleneck)  # [B, 512]
+            
+            # Fuse 5-slice features for auxiliary classification
+            seg_compressed_features = self.seg_feature_compressor(multi_slice_seg_features)
+            seg_features_flat = seg_compressed_features.view(B, -1)
+            
+            # Feature fusion
+            combined_features = torch.cat([swin_features, seg_features_flat], dim=1)
+            cls_output = self.feature_fusion(combined_features)  # [B, 1]
+        
+        # Return results
+        result = {
+            'segmentation': seg_output  # [B, 1, H, W] - Center slice only
+        }
+        if return_classification:
+            result['classification'] = cls_output
+        if return_features:
+            result['reconstruction_targets'] = reconstruction_targets
+            result['complete_features'] = complete_features
+        
+        return result
+
+print("[INFO] Core architecture modules loaded successfully")
+
+# ==================== Data Augmentation ====================
+
+class DataAugmentation:
+    """
+    Comprehensive data augmentation for medical images.
+    
+    Includes geometric, elastic, and intensity transformations.
+    Applied during training to improve model generalization.
+    """
+    
+    def __init__(self, 
+                 rotation_range=20,
+                 scale_range=(0.85, 1.15),
+                 translation_range=0.1,
+                 elastic_alpha=100,
+                 elastic_sigma=10,
+                 brightness_range=0.2,
+                 contrast_range=0.2):
+        
+        self.rotation_range = rotation_range
+        self.scale_range = scale_range
+        self.translation_range = translation_range
+        self.elastic_alpha = elastic_alpha
+        self.elastic_sigma = elastic_sigma
+        self.brightness_range = brightness_range
+        self.contrast_range = contrast_range
+    
+    def random_rotation(self, image, mask):
+        """Random rotation within range."""
+        angle = np.random.uniform(-self.rotation_range, self.rotation_range)
+        h, w = image.shape[:2]
+        center = (w / 2, h / 2)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        
+        image = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_LINEAR, borderValue=0)
+        mask = cv2.warpAffine(mask, M, (w, h), flags=cv2.INTER_NEAREST, borderValue=0)
+        return image, mask
+    
+    def random_scale(self, image, mask):
+        """Random scaling within range."""
+        scale = np.random.uniform(self.scale_range[0], self.scale_range[1])
+        h, w = image.shape[:2]
+        new_h, new_w = int(h * scale), int(w * scale)
+        
+        image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        mask = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+        
+        # Crop or pad to original size
+        if scale > 1.0:
+            # Crop center
+            start_h = (new_h - h) // 2
+            start_w = (new_w - w) // 2
+            image = image[start_h:start_h+h, start_w:start_w+w]
+            mask = mask[start_h:start_h+h, start_w:start_w+w]
+        else:
+            # Pad to center
+            pad_h = (h - new_h) // 2
+            pad_w = (w - new_w) // 2
+            image = cv2.copyMakeBorder(image, pad_h, h-new_h-pad_h, pad_w, w-new_w-pad_w, 
+                                      cv2.BORDER_CONSTANT, value=0)
+            mask = cv2.copyMakeBorder(mask, pad_h, h-new_h-pad_h, pad_w, w-new_w-pad_w,
+                                     cv2.BORDER_CONSTANT, value=0)
+        return image, mask
+    
+    def random_translation(self, image, mask):
+        """Random translation within range."""
+        h, w = image.shape[:2]
+        tx = np.random.uniform(-self.translation_range, self.translation_range) * w
+        ty = np.random.uniform(-self.translation_range, self.translation_range) * h
+        
+        M = np.float32([[1, 0, tx], [0, 1, ty]])
+        image = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_LINEAR, borderValue=0)
+        mask = cv2.warpAffine(mask, M, (w, h), flags=cv2.INTER_NEAREST, borderValue=0)
+        return image, mask
+    
+    def elastic_transform(self, image, mask):
+        """Elastic deformation."""
+        h, w = image.shape[:2]
+        
+        # Generate random displacement fields
+        dx = gaussian_filter((np.random.rand(h, w) * 2 - 1), self.elastic_sigma) * self.elastic_alpha
+        dy = gaussian_filter((np.random.rand(h, w) * 2 - 1), self.elastic_sigma) * self.elastic_alpha
+        
+        # Create meshgrid
+        x, y = np.meshgrid(np.arange(w), np.arange(h))
+        indices = (np.clip(y + dy, 0, h-1).astype(np.float32),
+                  np.clip(x + dx, 0, w-1).astype(np.float32))
+        
+        # Apply transformation
+        image = cv2.remap(image, indices[1], indices[0], cv2.INTER_LINEAR, borderValue=0)
+        mask = cv2.remap(mask, indices[1], indices[0], cv2.INTER_NEAREST, borderValue=0)
+        return image, mask
+    
+    def random_flip(self, image, mask):
+        """Random horizontal/vertical flip."""
+        if np.random.rand() > 0.5:
+            image = cv2.flip(image, 1)  # Horizontal
+            mask = cv2.flip(mask, 1)
+        if np.random.rand() > 0.5:
+            image = cv2.flip(image, 0)  # Vertical
+            mask = cv2.flip(mask, 0)
+        return image, mask
+    
+    def random_brightness_contrast(self, image):
+        """Random brightness and contrast adjustment."""
+        # Brightness
+        brightness = np.random.uniform(-self.brightness_range, self.brightness_range)
+        image = np.clip(image + brightness * 255, 0, 255)
+        
+        # Contrast
+        contrast = np.random.uniform(1 - self.contrast_range, 1 + self.contrast_range)
+        mean = image.mean()
+        image = np.clip((image - mean) * contrast + mean, 0, 255)
+        
+        return image.astype(np.uint8)
+    
+    def __call__(self, images_dict, mask, apply_geometric=True, apply_intensity=True):
+        """
+        Apply augmentation to multi-modal images and mask.
+        
+        Args:
+            images_dict: dict {modality: image_array}
+            mask: mask array
+            apply_geometric: Whether to apply geometric transforms
+            apply_intensity: Whether to apply intensity transforms
+            
+        Returns:
+            Augmented images_dict and mask
+        """
+        if apply_geometric:
+            # Apply same geometric transforms to all modalities and mask
+            if np.random.rand() > 0.5:
+                images_dict = {mod: img for mod, img in images_dict.items()}
+                mask_aug = mask.copy()
+                
+                # Rotation
+                if np.random.rand() > 0.5:
+                    angle = np.random.uniform(-self.rotation_range, self.rotation_range)
+                    h, w = mask_aug.shape[:2]
+                    center = (w / 2, h / 2)
+                    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+                    for mod in images_dict:
+                        images_dict[mod] = cv2.warpAffine(images_dict[mod], M, (w, h), 
+                                                         flags=cv2.INTER_LINEAR, borderValue=0)
+                    mask_aug = cv2.warpAffine(mask_aug, M, (w, h), 
+                                            flags=cv2.INTER_NEAREST, borderValue=0)
+                
+                # Flip
+                if np.random.rand() > 0.5:
+                    flip_code = np.random.choice([0, 1, -1])
+                    for mod in images_dict:
+                        images_dict[mod] = cv2.flip(images_dict[mod], flip_code)
+                    mask_aug = cv2.flip(mask_aug, flip_code)
+                
+                # Elastic deformation
+                if np.random.rand() > 0.7:
+                    h, w = mask_aug.shape[:2]
+                    dx = gaussian_filter((np.random.rand(h, w) * 2 - 1), 
+                                       self.elastic_sigma) * self.elastic_alpha
+                    dy = gaussian_filter((np.random.rand(h, w) * 2 - 1), 
+                                       self.elastic_sigma) * self.elastic_alpha
+                    x, y = np.meshgrid(np.arange(w), np.arange(h))
+                    indices = (np.clip(y + dy, 0, h-1).astype(np.float32),
+                              np.clip(x + dx, 0, w-1).astype(np.float32))
+                    
+                    for mod in images_dict:
+                        images_dict[mod] = cv2.remap(images_dict[mod], indices[1], indices[0],
+                                                    cv2.INTER_LINEAR, borderValue=0)
+                    mask_aug = cv2.remap(mask_aug, indices[1], indices[0],
+                                       cv2.INTER_NEAREST, borderValue=0)
+                
+                mask = mask_aug
+        
+        if apply_intensity:
+            # Apply intensity transforms independently to each modality
+            for mod in images_dict:
+                if np.random.rand() > 0.5:
+                    images_dict[mod] = self.random_brightness_contrast(images_dict[mod])
+        
+        return images_dict, mask
+
+
+# ==================== Dataset Class ====================
+
+class MultiModalMRIDataset(Dataset):
+    """
+    Multi-modal MRI dataset with flexible modality support.
+    
+    Supports:
+    - Single-slice mode: Load one slice per patient
+    - Multi-slice mode: Load 5 adjacent slices (center ±2)
+    - Missing modality handling
+    - PCR classification labels
+    """
+    
+    def __init__(self, data_root, clinical_file, modalities, 
+                 img_size=(512, 512), mode='train', 
+                 multi_slice_mode=False, augment=True):
+        """
+        Args:
+            data_root: Root directory containing patient data
+            clinical_file: Path to CSV file with PCR labels
+            modalities: List of modality names
+            img_size: Target image size
+            mode: 'train', 'val', or 'test'
+            multi_slice_mode: Whether to load 5 adjacent slices
+            augment: Whether to apply data augmentation
+        """
+        self.data_root = Path(data_root)
+        self.modalities = modalities
+        self.img_size = img_size
+        self.mode = mode
+        self.multi_slice_mode = multi_slice_mode
+        self.augment = augment and (mode == 'train')
+        
+        # Load clinical labels
+        self.clinical_data = self._load_clinical_data(clinical_file)
+        
+        # Scan patient directories
+        self.samples = self._scan_dataset()
+        
+        # Data augmentation
+        if self.augment:
+            self.augmentor = DataAugmentation(
+                rotation_range=15,
+                scale_range=(0.9, 1.1),
+                translation_range=0.05,
+                elastic_alpha=50,
+                elastic_sigma=8,
+                brightness_range=0.15,
+                contrast_range=0.15
+            )
+        
+        print(f"[INFO] Dataset loaded: {len(self.samples)} samples ({mode} mode)")
+        print(f"      Multi-slice mode: {multi_slice_mode}")
+        print(f"      Augmentation: {self.augment}")
+    
+    def _load_clinical_data(self, clinical_file):
+        """Load PCR labels from CSV file."""
+        if not os.path.exists(clinical_file):
+            print(f"[WARNING] Clinical file not found: {clinical_file}")
+            return {}
+        
+        try:
+            df = pd.read_csv(clinical_file)
+            clinical_dict = {}
+            
+            for _, row in df.iterrows():
+                patient_id = str(row['patient_id'])
+                pcr_label = int(row['pcr_label'])  # 0 or 1
+                clinical_dict[patient_id] = pcr_label
+            
+            print(f"[INFO] Loaded clinical data: {len(clinical_dict)} patients")
+            return clinical_dict
+        
+        except Exception as e:
+            print(f"[ERROR] Failed to load clinical data: {e}")
+            return {}
+    
+    def _scan_dataset(self):
+        """Scan dataset and collect valid samples."""
+        samples = []
+        
+        if not self.data_root.exists():
+            print(f"[ERROR] Data root not found: {self.data_root}")
+            return samples
+        
+        patient_dirs = [d for d in self.data_root.iterdir() if d.is_dir()]
+        
+        for patient_dir in patient_dirs:
+            patient_id = patient_dir.name
+            
+            # Check modality availability
+            available_modalities = []
+            modality_paths = {}
+            
+            for modality in self.modalities:
+                mod_dir = patient_dir / modality / 'ori'
+                mask_dir = patient_dir / modality / 'mask'
+                
+                if mod_dir.exists() and mask_dir.exists():
+                    ori_files = sorted(list(mod_dir.glob('ori_*.png')))
+                    mask_files = sorted(list(mask_dir.glob('mask_*.png')))
+                    
+                    if len(ori_files) > 0 and len(mask_files) > 0:
+                        available_modalities.append(modality)
+                        modality_paths[modality] = {
+                            'ori': ori_files,
+                            'mask': mask_files
+                        }
+            
+            # Require at least one modality
+            if len(available_modalities) == 0:
+                continue
+            
+            # Get PCR label
+            pcr_label = self.clinical_data.get(patient_id, 0)  # Default to 0
+            
+            # Find common slice indices across modalities
+            common_slices = self._find_common_slices(modality_paths)
+            
+            if len(common_slices) == 0:
+                continue
+            
+            # Select center slice (or all slices depending on mode)
+            if self.multi_slice_mode:
+                # Need at least 5 slices
+                if len(common_slices) >= 5:
+                    center_idx = len(common_slices) // 2
+                    slice_indices = list(range(center_idx - 2, center_idx + 3))
+                    
+                    samples.append({
+                        'patient_id': patient_id,
+                        'modality_paths': modality_paths,
+                        'available_modalities': available_modalities,
+                        'slice_indices': slice_indices,
+                        'pcr_label': pcr_label
+                    })
+            else:
+                # Single-slice mode: use center slice
+                center_idx = len(common_slices) // 2
+                center_slice = common_slices[center_idx]
+                
+                samples.append({
+                    'patient_id': patient_id,
+                    'modality_paths': modality_paths,
+                    'available_modalities': available_modalities,
+                    'slice_index': center_slice,
+                    'pcr_label': pcr_label
+                })
+        
+        return samples
+    
+    def _find_common_slices(self, modality_paths):
+        """Find slice indices common to all available modalities."""
+        slice_sets = []
+        
+        for modality, paths in modality_paths.items():
+            ori_files = paths['ori']
+            slice_indices = []
+            for f in ori_files:
+                match = re.search(r'ori_(\d+)\.png', f.name)
+                if match:
+                    slice_indices.append(int(match.group(1)))
+            slice_sets.append(set(slice_indices))
+        
+        if len(slice_sets) == 0:
+            return []
+        
+        common = slice_sets[0]
+        for s in slice_sets[1:]:
+            common = common.intersection(s)
+        
+        return sorted(list(common))
+    
+    def _load_image(self, file_path):
+        """Load and preprocess image."""
+        img = cv2.imread(str(file_path), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return np.zeros(self.img_size, dtype=np.uint8)
+        
+        # Resize if needed
+        if img.shape != self.img_size:
+            img = cv2.resize(img, (self.img_size[1], self.img_size[0]), 
+                           interpolation=cv2.INTER_LINEAR)
+        
+        return img
+    
+    def _load_mask(self, file_path):
+        """Load and preprocess mask."""
+        mask = cv2.imread(str(file_path), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            return np.zeros(self.img_size, dtype=np.uint8)
+        
+        # Resize if needed
+        if mask.shape != self.img_size:
+            mask = cv2.resize(mask, (self.img_size[1], self.img_size[0]),
+                            interpolation=cv2.INTER_NEAREST)
+        
+        # Binarize
+        mask = (mask > 127).astype(np.uint8)
+        return mask
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        """
+        Get sample by index.
+        
+        Returns:
+            dict: {
+                'images': [num_modalities, H, W] or [5, num_modalities, H, W]
+                'mask': [H, W]
+                'modality_mask': [num_modalities] - Availability mask
+                'pcr_label': int - PCR classification label
+                'patient_id': str
+            }
+        """
+        sample = self.samples[idx]
+        patient_id = sample['patient_id']
+        available_modalities = sample['available_modalities']
+        modality_paths = sample['modality_paths']
+        pcr_label = sample['pcr_label']
+        
+        if self.multi_slice_mode:
+            # Load 5 slices
+            slice_indices = sample['slice_indices']
+            images_list = []
+            masks_list = []
+            
+            for slice_idx in slice_indices:
+                slice_images = {}
+                slice_mask = None
+                
+                for modality in self.modalities:
+                    if modality in available_modalities:
+                        ori_file = modality_paths[modality]['ori'][slice_idx]
+                        mask_file = modality_paths[modality]['mask'][slice_idx]
+                        
+                        img = self._load_image(ori_file)
+                        slice_images[modality] = img
+                        
+                        if slice_mask is None:
+                            slice_mask = self._load_mask(mask_file)
+                    else:
+                        slice_images[modality] = np.zeros(self.img_size, dtype=np.uint8)
+                        if slice_mask is None:
+                            slice_mask = np.zeros(self.img_size, dtype=np.uint8)
+                
+                # Apply augmentation to center slice only
+                if self.augment and slice_idx == slice_indices[2]:
+                    slice_images, slice_mask = self.augmentor(slice_images, slice_mask)
+                
+                # Stack modalities
+                images_array = np.stack([slice_images[mod] for mod in self.modalities], axis=0)
+                images_list.append(images_array)
+                masks_list.append(slice_mask)
+            
+            # Stack slices: [5, num_modalities, H, W]
+            images = np.stack(images_list, axis=0)
+            mask = masks_list[2]  # Use center slice mask only
+            
+        else:
+            # Single-slice mode
+            slice_idx = sample['slice_index']
+            images_dict = {}
+            mask = None
+            
+            for modality in self.modalities:
+                if modality in available_modalities:
+                    ori_file = modality_paths[modality]['ori'][slice_idx]
+                    mask_file = modality_paths[modality]['mask'][slice_idx]
+                    
+                    img = self._load_image(ori_file)
+                    images_dict[modality] = img
+                    
+                    if mask is None:
+                        mask = self._load_mask(mask_file)
+                else:
+                    images_dict[modality] = np.zeros(self.img_size, dtype=np.uint8)
+                    if mask is None:
+                        mask = np.zeros(self.img_size, dtype=np.uint8)
+            
+            # Apply augmentation
+            if self.augment:
+                images_dict, mask = self.augmentor(images_dict, mask)
+            
+            # Stack modalities: [num_modalities, H, W]
+            images = np.stack([images_dict[mod] for mod in self.modalities], axis=0)
+        
+        # Create modality availability mask
+        modality_mask = np.array([1 if mod in available_modalities else 0 
+                                 for mod in self.modalities], dtype=np.float32)
+        
+        # Normalize images to [0, 1]
+        images = images.astype(np.float32) / 255.0
+        mask = mask.astype(np.float32)
+        
+        # Convert to tensors
+        images = torch.from_numpy(images)
+        mask = torch.from_numpy(mask).unsqueeze(0)  # Add channel dimension
+        modality_mask = torch.from_numpy(modality_mask)
+        pcr_label = torch.tensor(pcr_label, dtype=torch.float32)
+        
+        return {
+            'images': images,
+            'mask': mask,
+            'modality_mask': modality_mask,
+            'pcr_label': pcr_label,
+            'patient_id': patient_id
+        }
+
+
+# ==================== Loss Functions ====================
+
+class CombinedLoss(nn.Module):
+    """
+    Combined loss for segmentation + classification.
+    
+    Segmentation: Dice Loss + BCE Loss
+    Classification: BCE Loss with label smoothing
+    Modal Reconstruction: MSE Loss
+    """
+    
+    def __init__(self, seg_weight=1.0, cls_weight=0.5, recon_weight=0.1, 
+                 label_smoothing=0.2):
+        super(CombinedLoss, self).__init__()
+        self.seg_weight = seg_weight
+        self.cls_weight = cls_weight
+        self.recon_weight = recon_weight
+        self.label_smoothing = label_smoothing
+        
+        self.bce_loss = nn.BCEWithLogitsLoss()
+        self.mse_loss = nn.MSELoss()
+    
+    def dice_loss(self, pred, target, smooth=1e-5):
+        """Dice loss for segmentation."""
+        pred = torch.sigmoid(pred)
+        intersection = (pred * target).sum(dim=(2, 3))
+        union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
+        dice = (2.0 * intersection + smooth) / (union + smooth)
+        return 1.0 - dice.mean()
+    
+    def forward(self, outputs, targets):
+        """
+        Compute combined loss.
+        
+        Args:
+            outputs: dict from model forward pass
+            targets: dict with ground truth data
+            
+        Returns:
+            dict: Individual and total losses
+        """
+        losses = {}
+        total_loss = 0.0
+        
+        # 1. Segmentation loss
+        seg_pred = outputs['segmentation']
+        seg_target = targets['mask']
+        
+        dice = self.dice_loss(seg_pred, seg_target)
+        bce_seg = self.bce_loss(seg_pred, seg_target)
+        seg_loss = dice + bce_seg
+        
+        losses['seg_loss'] = seg_loss
+        losses['dice_loss'] = dice
+        losses['bce_seg_loss'] = bce_seg
+        total_loss += self.seg_weight * seg_loss
+        
+        # 2. Classification loss (if available)
+        if 'classification' in outputs and outputs['classification'] is not None:
+            cls_pred = outputs['classification'].squeeze(-1)
+            cls_target = targets['pcr_label']
+            
+            # Label smoothing
+            if self.label_smoothing > 0:
+                cls_target = cls_target * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
+            
+            cls_loss = self.bce_loss(cls_pred, cls_target)
+            losses['cls_loss'] = cls_loss
+            total_loss += self.cls_weight * cls_loss
+        
+        # 3. Modal reconstruction loss (if available)
+        if 'reconstruction_targets' in outputs and 'complete_features' in outputs:
+            recon_targets = outputs['reconstruction_targets']
+            complete_features = outputs['complete_features']
+            
+            recon_loss = 0.0
+            for modality in recon_targets:
+                target_feat = recon_targets[modality]
+                complete_feat = complete_features[modality]
+                recon_loss += self.mse_loss(complete_feat, target_feat)
+            
+            recon_loss /= len(recon_targets)
+            losses['recon_loss'] = recon_loss
+            total_loss += self.recon_weight * recon_loss
+        
+        losses['total_loss'] = total_loss
+        return losses
+
+
+# ==================== Evaluation Metrics ====================
+
+def calculate_dice_coefficient(pred, target, threshold=0.5):
+    """Calculate Dice coefficient for segmentation."""
+    pred = (torch.sigmoid(pred) > threshold).float()
+    intersection = (pred * target).sum()
+    union = pred.sum() + target.sum()
+    
+    if union == 0:
+        return 1.0 if intersection == 0 else 0.0
+    
+    dice = (2.0 * intersection) / union
+    return dice.item()
+
+
+def calculate_iou(pred, target, threshold=0.5):
+    """Calculate IoU (Intersection over Union)."""
+    pred = (torch.sigmoid(pred) > threshold).float()
+    intersection = (pred * target).sum()
+    union = pred.sum() + target.sum() - intersection
+    
+    if union == 0:
+        return 1.0 if intersection == 0 else 0.0
+    
+    iou = intersection / union
+    return iou.item()
+
+
+def evaluate_segmentation(model, dataloader, device):
+    """Evaluate segmentation performance."""
+    model.eval()
+    
+    dice_scores = []
+    iou_scores = []
+    
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Evaluating segmentation"):
+            images = batch['images'].to(device)
+            masks = batch['mask'].to(device)
+            modality_mask = batch['modality_mask'].to(device)
+            
+            # Forward pass
+            outputs = model(images, modality_mask, 
+                          return_features=False, 
+                          return_classification=False,
+                          multi_slice_mode=(images.dim() == 5))
+            
+            seg_pred = outputs['segmentation']
+            
+            # Calculate metrics
+            dice = calculate_dice_coefficient(seg_pred, masks)
+            iou = calculate_iou(seg_pred, masks)
+            
+            dice_scores.append(dice)
+            iou_scores.append(iou)
+    
+    return {
+        'mean_dice': np.mean(dice_scores),
+        'std_dice': np.std(dice_scores),
+        'mean_iou': np.mean(iou_scores),
+        'std_iou': np.std(iou_scores)
+    }
+
+
+def evaluate_classification(model, dataloader, device):
+    """Evaluate classification performance."""
+    model.eval()
+    
+    all_preds = []
+    all_labels = []
+    all_probs = []
+    
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Evaluating classification"):
+            images = batch['images'].to(device)
+            modality_mask = batch['modality_mask'].to(device)
+            pcr_labels = batch['pcr_label'].cpu().numpy()
+            
+            # Forward pass
+            outputs = model(images, modality_mask,
+                          return_features=False,
+                          return_classification=True,
+                          multi_slice_mode=(images.dim() == 5))
+            
+            cls_logits = outputs['classification'].squeeze(-1)
+            cls_probs = torch.sigmoid(cls_logits).cpu().numpy()
+            cls_preds = (cls_probs > 0.5).astype(int)
+            
+            all_preds.extend(cls_preds)
+            all_labels.extend(pcr_labels)
+            all_probs.extend(cls_probs)
+    
+    # Calculate metrics
+    accuracy = accuracy_score(all_labels, all_preds)
+    precision = precision_score(all_labels, all_preds, zero_division=0)
+    recall = recall_score(all_labels, all_preds, zero_division=0)
+    f1 = f1_score(all_labels, all_preds, zero_division=0)
+    
+    try:
+        auc = roc_auc_score(all_labels, all_probs)
+    except:
+        auc = 0.0
+    
+    return {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'auc': auc
+    }
+
+
+# ==================== Visualization ====================
+
+def visualize_training_progress(batch, outputs, iteration, save_dir):
+    """Visualize training progress with predictions."""
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Get first sample from batch
+    images = batch['images'][0].cpu().numpy()  # [num_modalities, H, W] or [5, num_modalities, H, W]
+    mask_gt = batch['mask'][0, 0].cpu().numpy()  # [H, W]
+    
+    if images.ndim == 3:
+        # Single-slice mode: [num_modalities, H, W]
+        center_images = images
+    else:
+        # Multi-slice mode: [5, num_modalities, H, W]
+        center_images = images[2]  # Center slice
+    
+    seg_pred = torch.sigmoid(outputs['segmentation'][0, 0]).cpu().numpy()
+    seg_pred_binary = (seg_pred > 0.5).astype(np.float32)
+    
+    # Create figure
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    fig.suptitle(f'Training Progress - Iteration {iteration}', fontsize=16, fontweight='bold')
+    
+    # Row 1: Input modalities
+    modalities = ['T1', 'T2', 'T1C']
+    for i, mod in enumerate(modalities):
+        ax = axes[0, i]
+        ax.imshow(center_images[i], cmap='gray')
+        ax.set_title(f'{mod} Input')
+        ax.axis('off')
+    
+    # Row 2: Segmentation results
+    axes[1, 0].imshow(mask_gt, cmap='gray')
+    axes[1, 0].set_title('Ground Truth Mask')
+    axes[1, 0].axis('off')
+    
+    axes[1, 1].imshow(seg_pred, cmap='gray')
+    axes[1, 1].set_title(f'Prediction (Raw)')
+    axes[1, 1].axis('off')
+    
+    axes[1, 2].imshow(seg_pred_binary, cmap='gray')
+    axes[1, 2].set_title(f'Prediction (Binary)')
+    axes[1, 2].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(save_dir / f'training_vis_iter_{iteration}.png', dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+def plot_training_curves(curves_data, save_path):
+    """Plot training curves from logged data."""
+    if not curves_data or 'iterations' not in curves_data:
+        return
+    
+    iterations = curves_data['iterations']
+    
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    fig.suptitle('Training Curves', fontsize=16, fontweight='bold')
+    
+    # Loss curves
+    ax = axes[0, 0]
+    if 'train_loss' in curves_data:
+        ax.plot(iterations, curves_data['train_loss'], label='Train Loss', color='blue')
+    if 'val_loss' in curves_data:
+        ax.plot(iterations, curves_data['val_loss'], label='Val Loss', color='red')
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('Loss')
+    ax.set_title('Total Loss')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Dice score
+    ax = axes[0, 1]
+    if 'val_dice' in curves_data:
+        ax.plot(iterations, curves_data['val_dice'], label='Val Dice', color='green')
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('Dice Score')
+    ax.set_title('Segmentation Dice Score')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Classification accuracy
+    ax = axes[1, 0]
+    if 'val_accuracy' in curves_data:
+        ax.plot(iterations, curves_data['val_accuracy'], label='Val Accuracy', color='purple')
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('Accuracy')
+    ax.set_title('Classification Accuracy')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Learning rate
+    ax = axes[1, 1]
+    if 'learning_rate' in curves_data:
+        ax.plot(iterations, curves_data['learning_rate'], label='Learning Rate', color='orange')
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('Learning Rate')
+    ax.set_title('Learning Rate Schedule')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+
+# ==================== Training Loop ====================
+
+def train_model():
+    """Main training function."""
+    print("\n" + "="*80)
+    print("MULTI-MODAL MRI JOINT TRAINING - SEGMENTATION + CLASSIFICATION")
+    print("="*80)
+    
+    # Create output directories
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+    
+    # Initialize datasets
+    print("\n[INFO] Initializing datasets...")
+    train_dataset = MultiModalMRIDataset(
+        data_root=TRAIN_DIR,
+        clinical_file=CLINICAL_FILE,
+        modalities=MODALITIES,
+        img_size=IMG_SIZE,
+        mode='train',
+        multi_slice_mode=False,  # Set to True for 5-slice mode
+        augment=True
+    )
+    
+    val_dataset = MultiModalMRIDataset(
+        data_root=VAL_DIR,
+        clinical_file=CLINICAL_FILE,
+        modalities=MODALITIES,
+        img_size=IMG_SIZE,
+        mode='val',
+        multi_slice_mode=False,
+        augment=False
+    )
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        drop_last=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True
+    )
+    
+    print(f"  Training samples: {len(train_dataset)}")
+    print(f"  Validation samples: {len(val_dataset)}")
+    
+    # Initialize model
+    print("\n[INFO] Initializing model...")
+    model = MultiModal2DUNet(
+        modalities=MODALITIES,
+        out_channels=OUT_CHANNELS,
+        base_features=BASE_FEATURES,
+        img_size=IMG_SIZE,
+        enable_classification=ENABLE_CLASSIFICATION
+    ).to(DEVICE)
+    
+    # Load pretrained weights if specified
+    if LOAD_COMPLETE_MODEL:
+        print(f"\n[INFO] Loading complete model from: {LOAD_COMPLETE_MODEL}")
+        checkpoint = torch.load(LOAD_COMPLETE_MODEL, map_location=DEVICE)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print("  Complete model loaded successfully")
+    
+    # Freeze components if specified
+    if FREEZE_SEGMENTATION:
+        print("\n[INFO] Freezing segmentation components...")
+        for param in model.modal_completion.parameters():
+            param.requires_grad = False
+        for param in model.main_encoder.parameters():
+            param.requires_grad = False
+        for param in model.segmentation_decoder.parameters():
+            param.requires_grad = False
+    
+    if FREEZE_CLASSIFICATION and ENABLE_CLASSIFICATION:
+        print("\n[INFO] Freezing classification components...")
+        for param in model.swin_transformer.parameters():
+            param.requires_grad = False
+        for param in model.seg_feature_compressor.parameters():
+            param.requires_grad = False
+        for param in model.feature_fusion.parameters():
+            param.requires_grad = False
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\n[INFO] Model parameters:")
+    print(f"  Total: {total_params:,}")
+    print(f"  Trainable: {trainable_params:,}")
+    
+    # Initialize optimizer and loss
+    print("\n[INFO] Initializing optimizer and loss...")
+    optimizer = optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=INITIAL_LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY
+    )
+    
+    criterion = CombinedLoss(
+        seg_weight=1.0,
+        cls_weight=0.5 if ENABLE_CLASSIFICATION else 0.0,
+        recon_weight=0.1,
+        label_smoothing=LABEL_SMOOTHING
+    )
+    
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=MAX_ITERATIONS,
+        eta_min=1e-6
+    )
+    
+    # Resume training if specified
+    start_iteration = 0
+    training_curves = {
+        'iterations': [],
+        'train_loss': [],
+        'val_loss': [],
+        'val_dice': [],
+        'val_accuracy': [],
+        'learning_rate': []
+    }
+    
+    if CONTINUE_TRAINING and RESUME_CHECKPOINT:
+        print(f"\n[INFO] Resuming training from: {RESUME_CHECKPOINT}")
+        checkpoint = torch.load(RESUME_CHECKPOINT, map_location=DEVICE)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        start_iteration = checkpoint['iteration']
+        
+        # Load training curves
+        if os.path.exists(TRAINING_CURVES_FILE):
+            with open(TRAINING_CURVES_FILE, 'r') as f:
+                training_curves = json.load(f)
+        
+        print(f"  Resumed from iteration {start_iteration}")
+    
+    # Training loop
+    print("\n" + "="*80)
+    print("STARTING TRAINING")
+    print("="*80)
+    
+    model.train()
+    iteration = start_iteration
+    best_val_dice = 0.0
+    
+    train_iterator = iter(train_loader)
+    
+    progress_bar = tqdm(total=MAX_ITERATIONS - start_iteration, 
+                       initial=0,
+                       desc="Training")
+    
+    while iteration < MAX_ITERATIONS:
+        try:
+            batch = next(train_iterator)
+        except StopIteration:
+            train_iterator = iter(train_loader)
+            batch = next(train_iterator)
+        
+        # Move data to device
+        images = batch['images'].to(DEVICE)
+        masks = batch['mask'].to(DEVICE)
+        modality_mask = batch['modality_mask'].to(DEVICE)
+        pcr_labels = batch['pcr_label'].to(DEVICE)
+        
+        # Forward pass
+        multi_slice_mode = (images.dim() == 5)
+        outputs = model(
+            images,
+            modality_mask,
+            return_features=True,
+            return_classification=ENABLE_CLASSIFICATION,
+            multi_slice_mode=multi_slice_mode
+        )
+        
+        # Compute loss
+        targets = {
+            'mask': masks,
+            'pcr_label': pcr_labels
+        }
+        losses = criterion(outputs, targets)
+        total_loss = losses['total_loss']
+        
+        # Backward pass
+        optimizer.zero_grad()
+        total_loss.backward()
+        
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP_VALUE)
+        
+        optimizer.step()
+        scheduler.step()
+        
+        # Update progress bar
+        progress_bar.set_postfix({
+            'loss': f"{total_loss.item():.4f}",
+            'dice': f"{losses.get('dice_loss', 0).item():.4f}",
+            'lr': f"{scheduler.get_last_lr()[0]:.2e}"
+        })
+        progress_bar.update(1)
+        
+        iteration += 1
+        
+        # Visualization
+        if iteration % VIS_INTERVAL == 0:
+            visualize_training_progress(batch, outputs, iteration, LOG_DIR)
+        
+        # Evaluation
+        if iteration % EVAL_INTERVAL == 0:
+            print(f"\n[INFO] Evaluation at iteration {iteration}...")
+            model.eval()
+            
+            # Segmentation evaluation
+            seg_metrics = evaluate_segmentation(model, val_loader, DEVICE)
+            print(f"  Segmentation - Dice: {seg_metrics['mean_dice']:.4f} ± {seg_metrics['std_dice']:.4f}")
+            print(f"                 IoU:  {seg_metrics['mean_iou']:.4f} ± {seg_metrics['std_iou']:.4f}")
+            
+            # Classification evaluation
+            if ENABLE_CLASSIFICATION:
+                cls_metrics = evaluate_classification(model, val_loader, DEVICE)
+                print(f"  Classification - Acc: {cls_metrics['accuracy']:.4f}, "
+                      f"Prec: {cls_metrics['precision']:.4f}, "
+                      f"Rec: {cls_metrics['recall']:.4f}, "
+                      f"F1: {cls_metrics['f1']:.4f}, "
+                      f"AUC: {cls_metrics['auc']:.4f}")
+            
+            # Update training curves
+            training_curves['iterations'].append(iteration)
+            training_curves['train_loss'].append(total_loss.item())
+            training_curves['val_dice'].append(seg_metrics['mean_dice'])
+            training_curves['learning_rate'].append(scheduler.get_last_lr()[0])
+            
+            if ENABLE_CLASSIFICATION:
+                training_curves['val_accuracy'].append(cls_metrics['accuracy'])
+            
+            # Save training curves
+            with open(TRAINING_CURVES_FILE, 'w') as f:
+                json.dump(training_curves, f, indent=2)
+            
+            # Plot curves
+            plot_training_curves(training_curves, 
+                               os.path.join(LOG_DIR, 'training_curves.png'))
+            
+            # Save best model
+            if seg_metrics['mean_dice'] > best_val_dice:
+                best_val_dice = seg_metrics['mean_dice']
+                best_model_path = os.path.join(SAVE_DIR, 'best_model.pth')
+                torch.save({
+                    'iteration': iteration,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'best_val_dice': best_val_dice,
+                    'seg_metrics': seg_metrics,
+                    'cls_metrics': cls_metrics if ENABLE_CLASSIFICATION else None
+                }, best_model_path)
+                print(f"  Saved best model (Dice: {best_val_dice:.4f})")
+            
+            model.train()
+        
+        # Save checkpoint
+        if iteration % SAVE_INTERVAL == 0:
+            checkpoint_path = os.path.join(SAVE_DIR, f'checkpoint_iter_{iteration}.pth')
+            torch.save({
+                'iteration': iteration,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_val_dice': best_val_dice
+            }, checkpoint_path)
+            print(f"\n[INFO] Checkpoint saved: {checkpoint_path}")
+    
+    progress_bar.close()
+    
+    # Final evaluation
+    print("\n" + "="*80)
+    print("FINAL EVALUATION")
+    print("="*80)
+    
+    model.eval()
+    seg_metrics = evaluate_segmentation(model, val_loader, DEVICE)
+    print(f"\nSegmentation Results:")
+    print(f"  Mean Dice: {seg_metrics['mean_dice']:.4f} ± {seg_metrics['std_dice']:.4f}")
+    print(f"  Mean IoU:  {seg_metrics['mean_iou']:.4f} ± {seg_metrics['std_iou']:.4f}")
+    
+    if ENABLE_CLASSIFICATION:
+        cls_metrics = evaluate_classification(model, val_loader, DEVICE)
+        print(f"\nClassification Results:")
+        print(f"  Accuracy:  {cls_metrics['accuracy']:.4f}")
+        print(f"  Precision: {cls_metrics['precision']:.4f}")
+        print(f"  Recall:    {cls_metrics['recall']:.4f}")
+        print(f"  F1 Score:  {cls_metrics['f1']:.4f}")
+        print(f"  AUC:       {cls_metrics['auc']:.4f}")
+    
+    # Save final model
+    final_model_path = os.path.join(SAVE_DIR, 'final_model.pth')
+    torch.save({
+        'iteration': iteration,
+        'model_state_dict': model.state_dict(),
+        'seg_metrics': seg_metrics,
+        'cls_metrics': cls_metrics if ENABLE_CLASSIFICATION else None
+    }, final_model_path)
+    print(f"\n[INFO] Final model saved: {final_model_path}")
+    
+    print("\n" + "="*80)
+    print("TRAINING COMPLETE")
+    print("="*80)
+
+if __name__ == '__main__':
+        train_model()
+
