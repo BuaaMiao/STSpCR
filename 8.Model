@@ -72,7 +72,7 @@ CONFIG = {
     
     # Training parameters
     'batch_size': 8,
-    'max_iterations': 200000,
+    'max_iterations': 8000,
     'initial_lr': 1e-4,
     'weight_decay': 1e-3,
     'gradient_clip_value': 1.0,
